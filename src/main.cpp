@@ -528,8 +528,15 @@ static void ui_update(float pitchDeg, float rollDeg, float long_g, float lat_g)
   lv_img_set_angle(imgPitch, (int16_t)(PITCH_SIGN * pitchDeg * 10.0f));
   lv_img_set_angle(imgRoll,  (int16_t)(ROLL_SIGN  * rollDeg  * 10.0f));
 
-  const int p = (int)lroundf(pitchDeg);
-  const int r = (int)lroundf(rollDeg);
+  // Pitch readout sign is flipped relative to the raw value/graphic angle
+  // above: nose-down/downhill reads negative, nose-up/uphill reads
+  // positive. Only the displayed number - not the image rotation angle,
+  // which already tilts the correct visual direction.
+  const int p = (int)lroundf(-pitchDeg);
+  // Roll readout is a magnitude only (always shown as positive) - the
+  // side/back graphic's tilt direction is what tells you left vs right,
+  // via ROLL_SIGN * rollDeg above, which stays signed.
+  const int r = (int)lroundf(fabsf(rollDeg));
 
   static char lp[8], lr[8];
   snprintf(lp, sizeof(lp), "%d", p);
