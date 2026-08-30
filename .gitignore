@@ -29,3 +29,6 @@
 
 # Security
 include/wifi_credentials.h
+
+# Graphics converter tool venv
+tools/graphics/.venv/

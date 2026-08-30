@@ -23,12 +23,21 @@ PlatformIO:
 
 ## WiFi setup
 No SSID/password is baked into the firmware. On first boot (or when re-entering the SETUP screen -
-swipe left from the calibration screen), the device starts its own hotspot with a captive portal:
+swipe left or right from the clock screen), the device starts its own hotspot with a captive portal:
 - Scan the on-screen QR code, or manually join the `TiltDash-XXXX` WiFi network.
-- A page listing nearby networks opens automatically (or open `http://<shown IP>` manually).
-- Pick your network, save - the device restarts and connects as a client.
+- A page listing nearby networks opens automatically (or open `http://<shown IP>` manually);
+  tap "Rescan" if the list comes up empty the first time.
+- Pick your network and save (its own form/button) - the device restarts and connects as a client.
+- Timezone is a separate form/button on the same page, so it can be changed without re-entering
+  WiFi credentials. It's a fixed UTC offset, not automatic DST - switch it by hand twice a year.
 
 See `include/wifi_portal.h` / `src/wifi_portal.cpp`.
+
+## Screen navigation
+Two independent horizontal loops, linked vertically:
+- **Level 1**: CLOCK <-> SETUP (swipe left/right from either one)
+- **Level 2**: MAIN (tilt readout) <-> CALIBRATION (swipe left/right from either one)
+- **Vertical link**: CLOCK <-> MAIN (swipe down on CLOCK, swipe up on MAIN)
 
 ## Graphics pipeline (PNG -> LVGL C assets)
 
@@ -55,16 +64,26 @@ sizes:
 - **Export settings**: Use PNG-24 with alpha. Avoid indexed PNG, palette modes, or GIF (no alpha support).
 - **Avoid**: Indexed color, palette-based exports, or formats without proper alpha.
 
-### 2. Conversion Using LVGL Image Converter
-- Use LVGL online converter (https://lvgl.io/tools/imageconverter) or `lv_img_conv` command line tool.
-- **Output format**: Must be `LV_IMG_CF_TRUE_COLOR_ALPHA` (RGB565 + alpha byte).
-- **Color format**: RGB565 with alpha for LVGL v8 compatibility.
-- **Byte order**: For swap16 compatibility, ensure bytes are generated to match our LCD flush (we handle swapping in `convert565()`).
+### 2. Conversion
 
-Example command:
+**Option A - local script (recommended)**: `tools/graphics/png_to_lvgl.py` converts a PNG
+directly to the exact format below - see `tools/graphics/README.md` for setup/usage. Its output
+was verified byte-for-byte against the existing `background.png` -> `tiltdash_bg.c` pair.
+
+**Option B - LVGL's own tools**: the online converter (https://lvgl.io/tools/imageconverter) or
+`lv_img_conv` CLI:
 ```bash
 lv_img_conv input.png --format LV_IMG_CF_TRUE_COLOR_ALPHA --output output.c
 ```
+
+Either way, the target format is:
+- **Output format**: `LV_IMG_CF_TRUE_COLOR_ALPHA` - 3 bytes/pixel: RGB565 (2 bytes) + alpha (1 byte).
+- **RGB565 packing**: truncate each 8-bit channel (`R>>3`, `G>>2`, `B>>3`), pack as `(R5<<11)|(G6<<5)|B5`.
+- **Byte order**: that 16-bit value stored **little-endian** (low byte first) - this project builds
+  with `LV_COLOR_16_SWAP=0` in effect (`include/lv_conf.h` overrides the `=1` build flag in
+  `platformio.ini` - the header's `#define` wins since it's processed after the command-line one).
+  `convert565()` in `src/main.cpp` is unrelated to asset byte order - it only handles the small
+  `flush_tmp` scratch buffer path in the display flush callback.
 
 ### 3. File Placement and Naming Convention
 - Place generated `.c` files in `src/` and `.h` files in `include/` (PlatformIO structure).

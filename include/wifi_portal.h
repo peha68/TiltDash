@@ -23,6 +23,12 @@ bool wifi_portal_has_credentials();
 const char* wifi_portal_get_ssid();
 const char* wifi_portal_get_pass();
 
+// Saved UTC offset in minutes (e.g. 120 for UTC+2 / CEST) - configurable
+// from the same setup page as the WiFi credentials, since a fixed offset
+// baked into firmware means a recompile every DST transition. Valid
+// after wifi_portal_init(); defaults to +60 (UTC+1) if never set.
+int wifi_portal_get_tz_offset_min();
+
 // Starts setup mode: AP + DNS (captive portal) + web server with the
 // config form. Blocking for a couple of seconds (WiFi scan) - see the
 // comment on scanNetworksIntoHtml() in wifi_portal.cpp. Safe to call

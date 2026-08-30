@@ -39,7 +39,12 @@
 // loaded from NVS, set via the configuration portal (hotspot + web page),
 // so changing networks doesn't require a recompile.
 
-static constexpr int32_t  TZ_OFFSET_SEC     = 3600;   // UTC+1 (DST later)
+// Timezone offset is NOT fixed at compile time - it's loaded from NVS
+// (set via the portal's "Timezone" field, see wifi_portal.cpp) and applied
+// to timeClient in setup() via setTimeOffset(). This constant is only the
+// value the NTPClient object below is constructed with before that NVS
+// value is available; it's immediately overridden.
+static constexpr int32_t  TZ_OFFSET_SEC_DEFAULT = 3600;   // UTC+1
 static constexpr uint32_t WIFI_RETRY_MS     = 15000;  // retry WiFi connect every 15s
 static constexpr uint32_t NTP_RETRY_MS      = 5000;   // try NTP update every 5s while connected
 
@@ -149,7 +154,7 @@ static Preferences prefs;
 
 // ====== WiFi and NTP ======
 static WiFiUDP ntpUDP;
-static NTPClient timeClient(ntpUDP, "pool.ntp.org", TZ_OFFSET_SEC, 60000);
+static NTPClient timeClient(ntpUDP, "pool.ntp.org", TZ_OFFSET_SEC_DEFAULT, 60000);
 
 static bool     g_wifi_ok = false;
 static bool     g_ntp_ok  = false;
@@ -634,7 +639,9 @@ static void wifi_ntp_update_state()
         bool ok = timeClient.update();
         if (ok && timeClient.isTimeSet()) {
           g_ntp_ok = true;
-          Serial.println("[NTP] Time set.");
+          Serial.printf("[NTP] Time set. tz offset=%d min, formatted=%s, raw epoch(+offset)=%lu\n",
+                        wifi_portal_get_tz_offset_min(), timeClient.getFormattedTime().c_str(),
+                        (unsigned long)timeClient.getEpochTime());
         }
       }
     } else {
@@ -1196,29 +1203,12 @@ void setup()
   ui_init();
 
   wifi_portal_init();
+  Serial.printf("[BOOT] Applying saved tz offset: %d min\n", wifi_portal_get_tz_offset_min());
+  timeClient.setTimeOffset(wifi_portal_get_tz_offset_min() * 60);
 
   switch_screen(SCR_SPLASH);
   lv_obj_fade_in(splash_bg, 800, 120);
   splash_side_start_enter_anim();
-
-  // DIAGNOSTIC: one-shot WiFi scan right here at boot, completely
-  // independent of the setup portal's AP/mode machinery (no AP, no
-  // WebServer, no prior mode churn) - a clean baseline to compare
-  // against the portal's /scan, which has been returning 0 networks
-  // even in a location with a confirmed-broadcasting network nearby.
-  Serial.println("[BOOT-SCAN] Running one-shot WiFi scan (STA only, no AP)...");
-  WiFi.mode(WIFI_STA);
-  delay(300);
-  int bootScanN = WiFi.scanNetworks(false /* async */, true /* show_hidden */,
-                                     false /* passive */, 500 /* max_ms_per_chan */,
-                                     0 /* all channels */);
-  Serial.printf("[BOOT-SCAN] scanNetworks() returned %d, mode=%d, status=%d, heap free=%u\n",
-                bootScanN, (int)WiFi.getMode(), (int)WiFi.status(), (unsigned)ESP.getFreeHeap());
-  for (int i = 0; i < bootScanN; i++) {
-    Serial.printf("[BOOT-SCAN]   [%d] SSID='%s' RSSI=%d chan=%d enc=%d\n",
-                  i, WiFi.SSID(i).c_str(), WiFi.RSSI(i), WiFi.channel(i), (int)WiFi.encryptionType(i));
-  }
-  WiFi.scanDelete();
 
   if (!wifi_portal_has_credentials()) {
     // No saved network - go straight into setup mode instead of waiting

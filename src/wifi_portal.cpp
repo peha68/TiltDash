@@ -11,6 +11,51 @@ static constexpr const char* NVS_NAMESPACE = "wifinet";
 
 static String g_ssid;
 static String g_pass;
+static int    g_tzOffsetMin = 60; // default UTC+1, overridden by NVS if set
+
+// Curated list of real-world UTC offsets (minutes) for the setup page's
+// timezone <select> - deliberately not every 15-minute step from -12:00
+// to +14:00, since most of those don't correspond to an actual timezone.
+struct TzOption { int16_t minutes; const char* label; };
+static const TzOption TZ_OPTIONS[] = {
+    { -720, "UTC-12:00" },
+    { -660, "UTC-11:00" },
+    { -600, "UTC-10:00 (Hawaii)" },
+    { -540, "UTC-9:00 (Alaska)" },
+    { -480, "UTC-8:00 (US Pacific)" },
+    { -420, "UTC-7:00 (US Mountain)" },
+    { -360, "UTC-6:00 (US Central)" },
+    { -300, "UTC-5:00 (US Eastern)" },
+    { -240, "UTC-4:00 (Atlantic)" },
+    { -210, "UTC-3:30 (Newfoundland)" },
+    { -180, "UTC-3:00 (Brazil/Argentina)" },
+    { -120, "UTC-2:00" },
+    {  -60, "UTC-1:00" },
+    {    0, "UTC+0:00 (London winter)" },
+    {   60, "UTC+1:00 (CET - e.g. Poland winter)" },
+    {  120, "UTC+2:00 (CEST - e.g. Poland summer, EET)" },
+    {  180, "UTC+3:00 (Moscow)" },
+    {  210, "UTC+3:30 (Iran)" },
+    {  240, "UTC+4:00" },
+    {  270, "UTC+4:30 (Afghanistan)" },
+    {  300, "UTC+5:00" },
+    {  330, "UTC+5:30 (India)" },
+    {  345, "UTC+5:45 (Nepal)" },
+    {  360, "UTC+6:00" },
+    {  390, "UTC+6:30 (Myanmar)" },
+    {  420, "UTC+7:00" },
+    {  480, "UTC+8:00 (China)" },
+    {  540, "UTC+9:00 (Japan/Korea)" },
+    {  570, "UTC+9:30 (Australia Central)" },
+    {  600, "UTC+10:00 (Australia East)" },
+    {  630, "UTC+10:30 (Lord Howe)" },
+    {  660, "UTC+11:00" },
+    {  720, "UTC+12:00 (New Zealand)" },
+    {  765, "UTC+12:45 (Chatham)" },
+    {  780, "UTC+13:00" },
+    {  840, "UTC+14:00 (Kiribati)" },
+};
+static constexpr size_t TZ_OPTIONS_COUNT = sizeof(TZ_OPTIONS) / sizeof(TZ_OPTIONS[0]);
 
 // ====== AP / portal ======
 static WebServer   server(80);
@@ -117,7 +162,7 @@ static void handleRoot()
                   (unsigned)ESP.getFreeHeap());
 
     String page;
-    page.reserve(1600);
+    page.reserve(4000); // room for the timezone <option> list
 
     page += "<!DOCTYPE html><html><head><meta charset='utf-8'>"
             "<meta name='viewport' content='width=device-width, initial-scale=1'>"
@@ -144,6 +189,22 @@ static void handleRoot()
             "<label>Password</label>"
             "<input type='password' name='pass' maxlength='63'>"
             "<button type='submit'>Save and connect</button>"
+            "</form>"
+            "<hr style='margin-top:24px;border-color:#333'>"
+            "<form action='/save_tz' method='POST'>"
+            "<label>Timezone (independent of WiFi - saving this does not require a network)</label>"
+            "<select name='tz'>";
+    for (size_t i = 0; i < TZ_OPTIONS_COUNT; i++) {
+        page += "<option value='";
+        page += String(TZ_OPTIONS[i].minutes);
+        page += "'";
+        if (TZ_OPTIONS[i].minutes == g_tzOffsetMin) page += " selected";
+        page += ">";
+        page += TZ_OPTIONS[i].label;
+        page += "</option>";
+    }
+    page += "</select>"
+            "<button type='submit'>Save timezone</button>"
             "</form>"
             "<script>"
             "function scanNow(){"
@@ -199,6 +260,32 @@ static void handleSave()
     ESP.restart();
 }
 
+// Deliberately separate from handleSave(): that one requires a non-empty
+// SSID to submit at all, so a combined form made it impossible to change
+// only the timezone without also re-entering (or blanking out) the WiFi
+// network. This endpoint only ever touches "tzmin".
+static void handleSaveTz()
+{
+    int tzMin = server.arg("tz").toInt();
+
+    prefsWifi.begin(NVS_NAMESPACE, false);
+    prefsWifi.putInt("tzmin", tzMin);
+    prefsWifi.end();
+    g_tzOffsetMin = tzMin;
+
+    server.send(200, "text/html",
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'></head>"
+        "<body style='font-family:sans-serif;background:#111;color:#eee;padding:20px'>"
+        "<h2>Saved.</h2><p>Restarting...</p>"
+        "</body></html>");
+
+    Serial.printf("[WIFI-PORTAL] Saved tz=%d min (raw arg='%s'). Restarting...\n",
+                  tzMin, server.arg("tz").c_str());
+    delay(1200);
+    ESP.restart();
+}
+
 // ====== API ======
 
 void wifi_portal_init()
@@ -206,8 +293,11 @@ void wifi_portal_init()
     prefsWifi.begin(NVS_NAMESPACE, true);
     g_ssid = prefsWifi.getString("ssid", "");
     g_pass = prefsWifi.getString("pass", "");
+    g_tzOffsetMin = prefsWifi.getInt("tzmin", 60);
     prefsWifi.end();
 }
+
+int wifi_portal_get_tz_offset_min() { return g_tzOffsetMin; }
 
 bool wifi_portal_has_credentials()
 {
@@ -274,21 +364,6 @@ void wifi_portal_start_ap()
     WiFi.mode(WIFI_STA);
     delay(200);
 
-    // DIAGNOSTIC: every scan attempted so far through /scan (STA added
-    // back on top of an already-running AP) has come back with exactly 0
-    // networks, heap and timing both fine - which on ESP32 can mean a
-    // scan while AP+STA are concurrent gets limited to something less
-    // than a real full-channel sweep. This one-shot scan runs in plain
-    // STA mode with no AP up at all yet, to tell whether that's really
-    // AP_STA-specific or the radio finds nothing regardless of mode.
-    int probeScan = WiFi.scanNetworks(false, true, false, 500, 0);
-    Serial.printf("[WIFI-PORTAL] DIAGNOSTIC pre-AP probe scan (STA only, no AP) returned %d, mode=%d, status=%d\n",
-                  probeScan, (int)WiFi.getMode(), (int)WiFi.status());
-    for (int i = 0; i < probeScan; i++) {
-        Serial.printf("[WIFI-PORTAL]   probe [%d] SSID='%s' RSSI=%d\n", i, WiFi.SSID(i).c_str(), WiFi.RSSI(i));
-    }
-    WiFi.scanDelete();
-
     WiFi.mode(WIFI_AP_STA);
     delay(100);
 
@@ -328,6 +403,7 @@ void wifi_portal_start_ap()
         server.on("/", HTTP_GET, handleRoot);
         server.on("/scan", HTTP_GET, handleScan);
         server.on("/save", HTTP_POST, handleSave);
+        server.on("/save_tz", HTTP_POST, handleSaveTz);
         // Captive portal: any other path also serves the form, so the
         // phone/OS detects the portal and pops the sign-in prompt itself.
         server.onNotFound(handleRoot);
