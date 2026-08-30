@@ -309,6 +309,38 @@ ImuSample imu_get_sample()
     return g_lastSample;
 }
 
+// Angle shown on a display "breathes" by fractions of a degree even with
+// a stationary vehicle, purely from sensor noise passing through the
+// (deliberately fast, see LPF_ALPHA) EMA filter. Rather than slowing that
+// filter down - which would make it feel sluggish while actually
+// adjusting jacks - this adds a small hysteresis on top, only for
+// whatever's being displayed to a person: the shown pitch/roll only
+// moves once the real value has drifted far enough to matter. long_g/
+// lat_g (G-meter bars) stay fully responsive - the "breathing" complaint
+// was specifically about the rotating side/back graphics.
+static constexpr float DISPLAY_DEADBAND_DEG = 0.05f;
+
+ImuSample imu_get_display_sample()
+{
+    static ImuSample shown = { false, 0, 0, 0, 0 };
+    static bool inited = false;
+
+    ImuSample cur = g_lastSample;
+
+    if (!inited || fabsf(cur.pitchDeg - shown.pitchDeg) >= DISPLAY_DEADBAND_DEG) {
+        shown.pitchDeg = cur.pitchDeg;
+    }
+    if (!inited || fabsf(cur.rollDeg - shown.rollDeg) >= DISPLAY_DEADBAND_DEG) {
+        shown.rollDeg = cur.rollDeg;
+    }
+    shown.long_g = cur.long_g;
+    shown.lat_g  = cur.lat_g;
+    shown.valid  = cur.valid;
+    inited = true;
+
+    return shown;
+}
+
 bool imu_calibrate_zero()
 {
     Serial.println("[IMU] Calibrate ZERO...");
@@ -359,4 +391,9 @@ bool imu_calibrate_zero()
 
     Serial.println("[IMU] Calibrate: OK.");
     return true;
+}
+
+float imu_get_temperature_c()
+{
+    return QMI.getTemperature_C();
 }

@@ -2,6 +2,7 @@
 #include "imu.h"
 #include "tiltdash_images_105_alpha.h" // whatever vehicle graphics are currently compiled in - see img_assets/
 
+#include <ctype.h>
 #include <math.h>
 #include <string.h>
 #include <WiFi.h>
@@ -17,6 +18,13 @@ static constexpr const char* NVS_NAMESPACE = "wifinet";
 static String g_ssid;
 static String g_pass;
 static int    g_tzOffsetMin = 60; // default UTC+1, overridden by NVS if set
+static String g_deviceName;       // owner-chosen name, empty = use the MAC-suffixed default
+// Vehicle dimensions (cm) for converting pitch/roll to how much a corner
+// needs raising: dh = dimension * sin(angle). Defaults are a rough van/
+// small-camper ballpark - not accurate for any specific vehicle until the
+// owner sets their own via the setup page's "Vehicle dimensions" card.
+static float g_wheelbaseCm = 350.0f; // front-back axle spacing, used with pitch
+static float g_trackCm     = 180.0f; // left-right wheel spacing, used with roll
 
 // Curated list of real-world UTC offsets (minutes) for the setup page's
 // timezone <select> - deliberately not every 15-minute step from -12:00
@@ -81,24 +89,83 @@ static String g_monitorDateStr = "----------";
 
 // ====== Helpers ======
 
+static String defaultDeviceTag()
+{
+    // MAC-suffixed fallback identity, used for both the AP SSID and mDNS
+    // hostname whenever the owner hasn't picked a name of their own -
+    // guarantees multiple units nearby don't collide by default.
+    uint64_t mac = ESP.getEfuseMac();
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%04X", (unsigned)(mac & 0xFFFF));
+    return String(buf);
+}
+
+// DNS labels (mDNS hostnames) only allow letters/digits/hyphens, no
+// leading/trailing/duplicate hyphens - anything else in the owner's
+// chosen name gets folded into a single hyphen so "My Camper!" becomes
+// "my-camper" instead of silently breaking <name>.local resolution.
+static String sanitizeForHostname(const String& raw)
+{
+    String out;
+    out.reserve(raw.length());
+    bool lastWasHyphen = true; // true so we never start with a hyphen
+    for (size_t i = 0; i < raw.length(); i++) {
+        char c = raw[i];
+        if (isalnum((unsigned char)c)) {
+            out += (char)tolower((unsigned char)c);
+            lastWasHyphen = false;
+        } else if (!lastWasHyphen) {
+            out += '-';
+            lastWasHyphen = true;
+        }
+    }
+    while (out.length() && out[out.length() - 1] == '-') out.remove(out.length() - 1);
+    return out;
+}
+
 static String buildApSsid()
 {
-    // Unique hotspot name (MAC suffix) so multiple devices nearby don't
-    // collide on the same SSID.
-    uint64_t mac = ESP.getEfuseMac();
-    char buf[32];
-    snprintf(buf, sizeof(buf), "TiltDash-%04X", (unsigned)(mac & 0xFFFF));
-    return String(buf);
+    // WiFi SSIDs tolerate spaces/punctuation fine, so the owner's chosen
+    // name is used as-is (just length-capped - SSIDs are limited to 32
+    // bytes).
+    if (g_deviceName.length() > 0) {
+        String ssid = g_deviceName;
+        if (ssid.length() > 32) ssid = ssid.substring(0, 32);
+        return ssid;
+    }
+    return "TiltDash-" + defaultDeviceTag();
 }
 
 static String buildMdnsHostname()
 {
-    // Same MAC suffix as the AP SSID (lowercased, hyphenated) so multiple
-    // units on one network resolve to distinct <name>.local addresses.
-    uint64_t mac = ESP.getEfuseMac();
-    char buf[32];
-    snprintf(buf, sizeof(buf), "tiltdash-%04x", (unsigned)(mac & 0xFFFF));
-    return String(buf);
+    if (g_deviceName.length() > 0) {
+        String host = sanitizeForHostname(g_deviceName);
+        if (host.length() > 0) return host; // e.g. all-punctuation input falls through to the default below
+    }
+    String tag = defaultDeviceTag();
+    tag.toLowerCase(); // toLowerCase() mutates in place (returns void), can't be chained
+    return "tiltdash-" + tag;
+}
+
+// Used wherever the owner-chosen device name (arbitrary user input) gets
+// embedded into HTML - the setup/monitor page titles and the name
+// input's value attribute.
+static String htmlEscape(const String& s)
+{
+    String out;
+    out.reserve(s.length());
+    for (size_t i = 0; i < s.length(); i++) {
+        char c = s[i];
+        switch (c) {
+            case '&':  out += "&amp;";  break;
+            case '<':  out += "&lt;";   break;
+            case '>':  out += "&gt;";   break;
+            case '"':  out += "&quot;"; break;
+            case '\'': out += "&#39;";  break;
+            default:   out += c;        break;
+        }
+    }
+    return out;
 }
 
 static String jsonEscape(const String& s)
@@ -191,18 +258,35 @@ static constexpr int MONITOR_ROLL_SIGN  = +1;
 // mode changes involved.
 static void handleLive()
 {
-    ImuSample s = imu_get_sample();
+    ImuSample s = imu_get_display_sample();
     // pitch/roll: same sign/magnitude convention as the on-device MAIN/
     // MONITOR number readouts (see ui_update() in main.cpp) - pitch
     // negated (nose-down/downhill reads negative), roll a positive
     // magnitude only. pitchAngle/rollAngle: raw signed degrees, for
     // rotating the page's icons the same direction as the real images.
-    char json[160];
+    // Rough "how much to raise this end/side" estimate: dh = dimension *
+    // sin(angle). Magnitude only, same reasoning as the roll degrees -
+    // the icon's rotation direction already conveys which way, so this
+    // isn't duplicated as an invented "front/rear"/"left/right" label
+    // that could get the direction backwards for someone's mounting.
+    constexpr float DEG2RAD = 0.017453292519943295f; // matches imu.cpp's own constant
+    float pitchCm = fabsf(g_wheelbaseCm * sinf(s.pitchDeg * DEG2RAD));
+    float rollCm  = fabsf(g_trackCm     * sinf(s.rollDeg  * DEG2RAD));
+
+    // rssi: 0 is a sentinel for "not applicable" (using our own hotspot,
+    // so there's no STA link to measure) rather than a real reading.
+    int rssi = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
+    float tempC = imu_get_temperature_c();
+    if (isnan(tempC)) tempC = 0.0f; // NAN would print as "nan" and break JSON parsing client-side
+
+    char json[280];
     snprintf(json, sizeof(json),
-             "{\"pitch\":%.1f,\"roll\":%.1f,\"pitchAngle\":%.1f,\"rollAngle\":%.1f,\"valid\":%s,"
+             "{\"pitch\":%.1f,\"roll\":%.1f,\"pitchAngle\":%.1f,\"rollAngle\":%.1f,"
+             "\"pitchCm\":%.1f,\"rollCm\":%.1f,\"temp\":%.1f,\"rssi\":%d,\"valid\":%s,"
              "\"time\":\"%s\",\"date\":\"%s\"}",
              -s.pitchDeg, fabsf(s.rollDeg),
              MONITOR_PITCH_SIGN * s.pitchDeg, MONITOR_ROLL_SIGN * s.rollDeg,
+             pitchCm, rollCm, tempC, rssi,
              s.valid ? "true" : "false",
              g_monitorTimeStr.c_str(), g_monitorDateStr.c_str());
     server.send(200, "application/json", json);
@@ -285,12 +369,14 @@ static void handleBackImg() { sendLvImageAsBmp(tiltdash_back_105_alpha); }
 // wifi_monitor_start().
 static void handleMonitorRoot()
 {
+    String displayName = g_deviceName.length() > 0 ? htmlEscape(g_deviceName) : "TiltDash";
+
     String page;
-    page.reserve(3200);
+    page.reserve(3600);
 
     page += "<!DOCTYPE html><html><head><meta charset='utf-8'>"
             "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-            "<title>TiltDash - Monitor</title>"
+            "<title>" + displayName + " - Monitor</title>"
             "<style>"
             "*{box-sizing:border-box}"
             "body{font-family:-apple-system,'Segoe UI',Roboto,sans-serif;background:#111;color:#eee;"
@@ -309,13 +395,20 @@ static void handleMonitorRoot()
             ".icon{transition:transform 0.2s ease-out}"
             ".label{font-size:12px;color:#7b7d7d;letter-spacing:1.5px;margin-top:14px}"
             ".val{font-size:44px;font-weight:700;margin-top:2px;font-variant-numeric:tabular-nums}"
+            ".cm{font-size:12px;color:#7b7d7d;margin-top:4px}"
+            ".meta{margin-top:18px;font-size:12px;color:#666}"
             ".deg{font-size:20px;color:#7b7d7d;font-weight:400;vertical-align:14px;line-height:1}"
+            ".badge{display:inline-block;padding:8px 22px;border-radius:20px;font-weight:700;"
+            "font-size:13px;letter-spacing:1.5px;margin-top:2px;"
+            "background:#2a2a2a;color:#888;transition:background-color .3s,color .3s}"
+            ".badge.level{background:#1f4d2e;color:#5ad16b}"
             ".clock{margin:16px 0 22px}"
             ".clock #time{font-size:30px;font-weight:600;font-variant-numeric:tabular-nums}"
             ".clock #date{display:block;font-size:12px;color:#7b7d7d;margin-top:2px}"
             "</style></head><body>"
-            "<header><h1>TiltDash</h1>"
+            "<header><h1>" + displayName + "</h1>"
             "<div class='sub'><span class='dot'></span>Live monitor</div></header>"
+            "<div class='badge' id='levelBadge'>--</div>"
             "<div class='clock'><span id='time'>--:--</span><span id='date'>----------</span></div>"
             "<div class='row'>"
             "<div class='card'>"
@@ -327,22 +420,40 @@ static void handleMonitorRoot()
             // (side is wide, back is tall) don't push the labels below
             // them out of alignment between the two cards.
             "<div class='icon-wrap'><img class='icon' id='pitchIcon' src='/side.bmp' width='130'></div>"
-            "<div class='label'>PITCH</div><div class='val' id='p'>--<span class='deg'>&deg;</span></div></div>"
+            "<div class='label'>PITCH</div><div class='val' id='p'>--<span class='deg'>&deg;</span></div>"
+            "<div class='cm' id='pCm'>&asymp; -- cm</div></div>"
             "<div class='card'>"
             "<div class='icon-wrap'><img class='icon' id='rollIcon' src='/back.bmp' width='62'></div>"
-            "<div class='label'>ROLL</div><div class='val' id='r'>--<span class='deg'>&deg;</span></div></div>"
+            "<div class='label'>ROLL</div><div class='val' id='r'>--<span class='deg'>&deg;</span></div>"
+            "<div class='cm' id='rCm'>&asymp; -- cm</div></div>"
             "</div>"
+            "<div class='meta'>Sensor <span id='temp'>--</span>&deg;C &nbsp;&middot;&nbsp; "
+            "WiFi <span id='rssi'>--</span></div>"
             "<script>"
+            // toFixed(0) on a small negative float (e.g. -0.3) returns the
+            // string "-0" even though it's numerically zero - round trips
+            // through Math.round() first so -0 becomes a real 0.
+            "function fmt0(n){var v=Math.round(n);return v===0?0:v;}"
+            "var LEVEL_TOL=1;" // degrees - matches the badge's "close enough" threshold
             "function poll(){"
             "fetch('/live').then(function(r){return r.json();}).then(function(d){"
-            "document.getElementById('p').innerHTML=(d.valid?d.pitch.toFixed(0):'--')+\"<span class='deg'>&deg;</span>\";"
-            "document.getElementById('r').innerHTML=(d.valid?d.roll.toFixed(0):'--')+\"<span class='deg'>&deg;</span>\";"
+            "document.getElementById('p').innerHTML=(d.valid?fmt0(d.pitch):'--')+\"<span class='deg'>&deg;</span>\";"
+            "document.getElementById('r').innerHTML=(d.valid?fmt0(d.roll):'--')+\"<span class='deg'>&deg;</span>\";"
+            "document.getElementById('pCm').textContent='\\u2248 '+(d.valid?d.pitchCm.toFixed(1):'--')+' cm';"
+            "document.getElementById('rCm').textContent='\\u2248 '+(d.valid?d.rollCm.toFixed(1):'--')+' cm';"
+            "document.getElementById('temp').textContent=d.valid?d.temp.toFixed(1):'--';"
+            "document.getElementById('rssi').textContent=d.rssi?d.rssi+' dBm':'(own hotspot)';"
             "document.getElementById('pitchIcon').style.transform="
             "'rotate('+(d.valid?d.pitchAngle:0)+'deg)';"
             "document.getElementById('rollIcon').style.transform="
             "'rotate('+(d.valid?d.rollAngle:0)+'deg)';"
             "document.getElementById('time').textContent=d.time;"
             "document.getElementById('date').textContent=d.date;"
+            "var badge=document.getElementById('levelBadge');"
+            "if(!d.valid){badge.textContent='--';badge.className='badge';}"
+            "else if(Math.abs(d.pitch)<=LEVEL_TOL&&Math.abs(d.roll)<=LEVEL_TOL){"
+            "badge.textContent='\\u2713 LEVEL';badge.className='badge level';"
+            "}else{badge.textContent='ADJUSTING';badge.className='badge';}"
             "});"
             "}"
             "poll();setInterval(poll,400);"
@@ -360,12 +471,14 @@ static void handleRoot()
                   server.uri().c_str(), server.client().remoteIP().toString().c_str(),
                   (unsigned)ESP.getFreeHeap());
 
+    String displayName = g_deviceName.length() > 0 ? htmlEscape(g_deviceName) : "TiltDash";
+
     String page;
-    page.reserve(4600); // room for the timezone <option> list
+    page.reserve(5500); // room for the timezone <option> list
 
     page += "<!DOCTYPE html><html><head><meta charset='utf-8'>"
             "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-            "<title>TiltDash - Setup</title>"
+            "<title>" + displayName + " - Setup</title>"
             "<style>"
             "*{box-sizing:border-box}"
             "body{font-family:-apple-system,'Segoe UI',Roboto,sans-serif;background:#111;color:#eee;"
@@ -386,7 +499,7 @@ static void handleRoot()
             "border:none;border-radius:8px;font-size:15px;font-weight:600}"
             "button.secondary{background:transparent;color:#ccc;border:1px solid #333;margin-top:8px}"
             "</style></head><body>"
-            "<header><h1>TiltDash</h1><div class='sub'>Setup</div></header>"
+            "<header><h1>" + displayName + "</h1><div class='sub'>Setup</div></header>"
             "<div class='card'>"
             "<h2>WiFi network</h2>"
             "<form action='/save' method='POST'>"
@@ -418,6 +531,28 @@ static void handleRoot()
     }
     page += "</select>"
             "<button type='submit'>Save timezone</button>"
+            "</form>"
+            "</div>"
+            "<div class='card'>"
+            "<h2>Device name</h2>"
+            "<form action='/save_name' method='POST'>"
+            "<label>Used for the WiFi hotspot name and the monitor's .local address - "
+            "keep it unique if you have more than one TiltDash</label>"
+            "<input type='text' name='name' maxlength='32' placeholder='e.g. My Camper' value='"
+            + htmlEscape(g_deviceName) + "'>"
+            "<button type='submit'>Save name</button>"
+            "</form>"
+            "</div>"
+            "<div class='card'>"
+            "<h2>Vehicle dimensions</h2>"
+            "<form action='/save_dims' method='POST'>"
+            "<label>Wheelbase, cm (front-back axle spacing - used for the pitch estimate)</label>"
+            "<input type='number' name='wheelbase' min='1' step='1' value='"
+            + String(g_wheelbaseCm, 0) + "'>"
+            "<label>Track width, cm (left-right wheel spacing - used for the roll estimate)</label>"
+            "<input type='number' name='track' min='1' step='1' value='"
+            + String(g_trackCm, 0) + "'>"
+            "<button type='submit'>Save dimensions</button>"
             "</form>"
             "</div>"
             "<script>"
@@ -500,6 +635,57 @@ static void handleSaveTz()
     ESP.restart();
 }
 
+// Independent of WiFi/timezone, same reasoning as handleSaveTz(). No
+// restart needed - the AP SSID and mDNS hostname are only (re)built the
+// next time wifi_portal_start_ap()/wifi_monitor_start() runs, i.e. the
+// next time the setup or monitor screen is entered.
+static void handleSaveName()
+{
+    String name = server.arg("name");
+    name.trim();
+    if (name.length() > 32) name = name.substring(0, 32);
+
+    prefsWifi.begin(NVS_NAMESPACE, false);
+    prefsWifi.putString("devname", name);
+    prefsWifi.end();
+    g_deviceName = name;
+
+    server.send(200, "text/html",
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'></head>"
+        "<body style='font-family:sans-serif;background:#111;color:#eee;padding:20px'>"
+        "<h2>Saved.</h2><p>Takes effect next time you open the setup or monitor screen.</p>"
+        "</body></html>");
+
+    Serial.printf("[WIFI-PORTAL] Saved device name='%s'\n", name.c_str());
+}
+
+// Independent form, same reasoning as handleSaveName()/handleSaveTz() -
+// takes effect on the monitor page's next /live poll, no restart needed.
+static void handleSaveDims()
+{
+    float wheelbase = server.arg("wheelbase").toFloat();
+    float track     = server.arg("track").toFloat();
+    if (wheelbase <= 0) wheelbase = 350.0f;
+    if (track <= 0)     track     = 180.0f;
+
+    prefsWifi.begin(NVS_NAMESPACE, false);
+    prefsWifi.putFloat("wheelbase", wheelbase);
+    prefsWifi.putFloat("track", track);
+    prefsWifi.end();
+    g_wheelbaseCm = wheelbase;
+    g_trackCm     = track;
+
+    server.send(200, "text/html",
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'></head>"
+        "<body style='font-family:sans-serif;background:#111;color:#eee;padding:20px'>"
+        "<h2>Saved.</h2><p>Used for the cm estimate on the monitor page.</p>"
+        "</body></html>");
+
+    Serial.printf("[WIFI-PORTAL] Saved dimensions: wheelbase=%.0fcm track=%.0fcm\n", wheelbase, track);
+}
+
 // Registers every HTTP route once - shared between the setup portal (its
 // own AP) and the remote monitor (either that same AP as a fallback, or
 // directly over an existing STA connection). server.stop() doesn't clear
@@ -512,6 +698,8 @@ static void ensureHttpHandlersRegistered()
     server.on("/scan", HTTP_GET, handleScan);
     server.on("/save", HTTP_POST, handleSave);
     server.on("/save_tz", HTTP_POST, handleSaveTz);
+    server.on("/save_name", HTTP_POST, handleSaveName);
+    server.on("/save_dims", HTTP_POST, handleSaveDims);
     server.on("/live", HTTP_GET, handleLive);
     server.on("/side.bmp", HTTP_GET, handleSideImg);
     server.on("/back.bmp", HTTP_GET, handleBackImg);
@@ -529,8 +717,13 @@ void wifi_portal_init()
     g_ssid = prefsWifi.getString("ssid", "");
     g_pass = prefsWifi.getString("pass", "");
     g_tzOffsetMin = prefsWifi.getInt("tzmin", 60);
+    g_deviceName = prefsWifi.getString("devname", "");
+    g_wheelbaseCm = prefsWifi.getFloat("wheelbase", 350.0f);
+    g_trackCm     = prefsWifi.getFloat("track", 180.0f);
     prefsWifi.end();
 }
+
+const char* wifi_portal_get_device_name() { return g_deviceName.c_str(); }
 
 int wifi_portal_get_tz_offset_min() { return g_tzOffsetMin; }
 

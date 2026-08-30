@@ -1403,7 +1403,7 @@ void loop()
 
     // Main screen - update from last IMU sample
     if (current_screen == SCR_MAIN) {
-      ImuSample s = imu_get_sample();
+      ImuSample s = imu_get_display_sample();
       if (s.valid) {
         float pitchDeg = s.pitchDeg;
         float rollDeg  = s.rollDeg;
@@ -1422,7 +1422,7 @@ void loop()
     // Monitor screen - mirror the same live numbers shown remotely
     // (see handleLive() in wifi_portal.cpp - same sign/magnitude convention)
     if (current_screen == SCR_MONITOR) {
-      ImuSample s = imu_get_sample();
+      ImuSample s = imu_get_display_sample();
       if (s.valid) {
         static char mp[8], mr[8];
         snprintf(mp, sizeof(mp), "%d", (int)lroundf(-s.pitchDeg));

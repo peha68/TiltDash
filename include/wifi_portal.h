@@ -29,6 +29,14 @@ const char* wifi_portal_get_pass();
 // after wifi_portal_init(); defaults to +60 (UTC+1) if never set.
 int wifi_portal_get_tz_offset_min();
 
+// Owner-chosen device name (empty string if never set) - used for the AP
+// SSID and mDNS hostname (see buildApSsid()/buildMdnsHostname() in
+// wifi_portal.cpp) instead of the default MAC-suffixed "TiltDash-XXXX" /
+// "tiltdash-xxxx.local", and shown as the page title on both the setup
+// and monitor pages. Configurable from its own form on the setup page,
+// independent of WiFi/timezone.
+const char* wifi_portal_get_device_name();
+
 // Starts setup mode: AP + DNS (captive portal) + web server with the
 // config form. Blocking for a couple of seconds (WiFi scan) - see the
 // comment on scanNetworksIntoHtml() in wifi_portal.cpp. Safe to call
