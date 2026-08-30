@@ -48,3 +48,42 @@ void wifi_portal_loop();
 // Hotspot name and IP address - for showing on the setup screen.
 const char* wifi_portal_ap_ssid();
 IPAddress wifi_portal_ap_ip();
+
+// ====== Remote monitor ======
+// Lets a phone watch live pitch/roll from outside the vehicle while
+// levelling - useful since the display itself isn't visible from ground
+// level next to the jacks. Reuses the same WebServer/AP machinery as the
+// setup portal (same tested mode-transition/memory handling), just with a
+// different page: if already connected to a real network (STA), serves
+// straight from that connection (no AP needed) and advertises mDNS; if
+// not connected to anything, falls back to starting the device's own
+// hotspot like the setup screen does. Deliberately only runs while the
+// caller keeps it active (call wifi_monitor_stop() when leaving the
+// screen) rather than continuously, to keep steady-state memory usage low
+// - see the notes in wifi_portal_start_ap() about this board's tight RAM.
+void wifi_monitor_start();
+void wifi_monitor_stop();
+bool wifi_monitor_is_active();
+
+// Call on every loop() iteration while wifi_monitor_is_active() is true
+// AND wifi_portal_is_active() is false (the AP case is already serviced
+// by wifi_portal_loop()).
+void wifi_monitor_service();
+
+// True once wifi_monitor_start() had to fall back to the device's own
+// hotspot (no STA connection available) rather than using an existing
+// network.
+bool wifi_monitor_using_own_ap();
+
+// Reachable address for the phone to open, and hostname for the mDNS
+// case (only meaningful/reliable when NOT using the fallback AP - mDNS
+// resolution across a phone's own captive-AP connection is inconsistent
+// across OSes, so the IP is always shown too regardless).
+IPAddress wifi_monitor_ip();
+const char* wifi_monitor_hostname();
+
+// Pushes the current formatted time/date (from update_time_from_ntp() in
+// main.cpp) into the monitor page - wifi_portal.cpp has no access to
+// timeClient/NTP formatting itself. Safe to call regardless of whether
+// the monitor is active.
+void wifi_monitor_set_time(const char* time_str, const char* date_str);

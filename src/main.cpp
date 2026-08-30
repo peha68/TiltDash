@@ -314,6 +314,13 @@ static lv_obj_t* scr_setup      = nullptr;
 static lv_obj_t* setup_ssid_lbl = nullptr;
 static lv_obj_t* setup_ip_lbl   = nullptr;
 
+// Remote monitor objects
+static lv_obj_t* scr_monitor          = nullptr;
+static lv_obj_t* monitor_status_lbl   = nullptr;
+static lv_obj_t* monitor_address_lbl  = nullptr;
+static lv_obj_t* monitor_pitch_lbl    = nullptr;
+static lv_obj_t* monitor_roll_lbl     = nullptr;
+
 // WiFi blinking (opacity)
 static lv_timer_t* g_wifi_blink_timer = nullptr;
 static bool g_wifi_blink_on = true;
@@ -334,21 +341,23 @@ static int g_splash_side_w        = 0;
 static bool g_clock_shown_after_ntp = false;
 static bool g_clock_faded_in        = false;
 
-enum Screen { SCR_SPLASH, SCR_CLOCK, SCR_MAIN, SCR_CAL, SCR_SETUP };
+enum Screen { SCR_SPLASH, SCR_CLOCK, SCR_MAIN, SCR_CAL, SCR_SETUP, SCR_MONITOR };
 static Screen current_screen = SCR_SPLASH;
 
 // ====== Active IMU policy ======
 static inline bool imu_should_run()
 {
-  return (current_screen == SCR_MAIN) || (current_screen == SCR_CAL);
+  return (current_screen == SCR_MAIN) || (current_screen == SCR_CAL) || (current_screen == SCR_MONITOR);
 }
 
-// Defined further down (WiFi/NTP section and the SETUP screen) - forward
-// declarations so switch_screen() can call them when entering/leaving the
-// SETUP screen.
+// Defined further down (WiFi/NTP section and the SETUP/MONITOR screens) -
+// forward declarations so switch_screen() can call them when
+// entering/leaving those screens.
 static void wifi_begin_nonblocking();
 static void setup_screen_on_enter();
 static void setup_screen_on_leave();
+static void monitor_screen_on_enter();
+static void monitor_screen_on_leave();
 
 // ====== Helpers ======
 static void switch_screen(Screen new_screen) {
@@ -359,11 +368,15 @@ static void switch_screen(Screen new_screen) {
     case SCR_MAIN:   new_scr = scr_main;   break;
     case SCR_CAL:    new_scr = scr_cal;    break;
     case SCR_SETUP:  new_scr = scr_setup;  break;
+    case SCR_MONITOR: new_scr = scr_monitor; break;
   }
   if (!new_scr) return;
 
   if (current_screen == SCR_SETUP && new_screen != SCR_SETUP) {
     setup_screen_on_leave();
+  }
+  if (current_screen == SCR_MONITOR && new_screen != SCR_MONITOR) {
+    monitor_screen_on_leave();
   }
 
   lv_scr_load(new_scr);
@@ -371,6 +384,9 @@ static void switch_screen(Screen new_screen) {
 
   if (new_screen == SCR_SETUP) {
     setup_screen_on_enter();
+  }
+  if (new_screen == SCR_MONITOR) {
+    monitor_screen_on_enter();
   }
 }
 
@@ -428,6 +444,7 @@ static void update_time_from_ntp()
   snprintf(date_str, sizeof(date_str), "%04d-%02d-%02d", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
 
   update_time_labels(time_str, date_str);
+  wifi_monitor_set_time(time_str, date_str);
 }
 
 static lv_obj_t* make_zone(lv_obj_t* parent, int x, int y, int w, int h)
@@ -569,16 +586,16 @@ static void gesture_event_cb(lv_event_t* e)
   lv_dir_t dir = lv_indev_get_gesture_dir(indev);
 
   // Two independent horizontal loops, linked only vertically:
-  //   level 1 (top):    CLOCK <-> SETUP
-  //   level 2 (bottom): MAIN  <-> CAL
+  //   level 1 (top):    CLOCK <-> SETUP <-> MONITOR (3-way cycle)
+  //   level 2 (bottom): MAIN  <-> CAL   (2-way toggle)
   //   vertical link:    CLOCK <-> MAIN
-  // Each loop has just two screens, so either horizontal direction
-  // toggles between them - there's no meaningful "forward"/"backward"
-  // with only two stops.
+  // The top loop has 3 stops, so LEFT/RIGHT are genuinely forward/back;
+  // the bottom loop only has 2, so either direction just toggles.
   switch (current_screen) {
     case SCR_CLOCK:
       if (dir == LV_DIR_TOP) switch_screen(SCR_MAIN);
-      else if (dir == LV_DIR_LEFT || dir == LV_DIR_RIGHT) switch_screen(SCR_SETUP);
+      else if (dir == LV_DIR_LEFT) switch_screen(SCR_SETUP);
+      else if (dir == LV_DIR_RIGHT) switch_screen(SCR_MONITOR);
       break;
 
     case SCR_MAIN:
@@ -591,7 +608,13 @@ static void gesture_event_cb(lv_event_t* e)
       break;
 
     case SCR_SETUP:
-      if (dir == LV_DIR_LEFT || dir == LV_DIR_RIGHT) switch_screen(SCR_CLOCK);
+      if (dir == LV_DIR_LEFT) switch_screen(SCR_MONITOR);
+      else if (dir == LV_DIR_RIGHT) switch_screen(SCR_CLOCK);
+      break;
+
+    case SCR_MONITOR:
+      if (dir == LV_DIR_LEFT) switch_screen(SCR_CLOCK);
+      else if (dir == LV_DIR_RIGHT) switch_screen(SCR_SETUP);
       break;
 
     default:
@@ -984,6 +1007,46 @@ static void setup_screen_on_leave()
   }
 }
 
+// Entering the MONITOR screen: starts serving live pitch/roll over WiFi
+// (piggybacking on an existing connection if there is one, otherwise
+// falling back to this device's own hotspot the same way the setup
+// screen does) and shows how a phone reaches it. Called from
+// switch_screen().
+static void monitor_screen_on_enter()
+{
+  wifi_monitor_start();
+
+  if (wifi_monitor_using_own_ap()) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "Connect phone to:\n%s", wifi_portal_ap_ssid());
+    if (monitor_status_lbl) lv_label_set_text(monitor_status_lbl, buf);
+
+    char addr[48];
+    snprintf(addr, sizeof(addr), "http://%s", wifi_monitor_ip().toString().c_str());
+    if (monitor_address_lbl) lv_label_set_text(monitor_address_lbl, addr);
+  } else {
+    if (monitor_status_lbl) lv_label_set_text(monitor_status_lbl, "Connect phone to the same WiFi");
+
+    char addr[96];
+    snprintf(addr, sizeof(addr), "http://%s\nhttp://%s.local",
+             wifi_monitor_ip().toString().c_str(), wifi_monitor_hostname());
+    if (monitor_address_lbl) lv_label_set_text(monitor_address_lbl, addr);
+  }
+}
+
+// Leaving the MONITOR screen: stops serving (and the fallback hotspot, if
+// that's what got started) and - if we have a saved network - resumes
+// normal connecting as a client (STA).
+static void monitor_screen_on_leave()
+{
+  bool wasOwnAp = wifi_monitor_using_own_ap();
+  wifi_monitor_stop();
+
+  if (wasOwnAp && wifi_portal_has_credentials()) {
+    wifi_begin_nonblocking();
+  }
+}
+
 // ====== UI init ======
 static void ui_init()
 {
@@ -992,8 +1055,9 @@ static void ui_init()
   scr_main   = lv_obj_create(NULL);
   scr_cal    = lv_obj_create(NULL);
   scr_setup  = lv_obj_create(NULL);
+  scr_monitor = lv_obj_create(NULL);
 
-  lv_obj_t* screens[] = {scr_splash, scr_clock, scr_main, scr_cal, scr_setup};
+  lv_obj_t* screens[] = {scr_splash, scr_clock, scr_main, scr_cal, scr_setup, scr_monitor};
   for (auto* scr : screens) {
     lv_obj_set_style_bg_color(scr, lv_color_black(), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
@@ -1158,8 +1222,51 @@ static void ui_init()
 
   lv_obj_t* setupHint3 = lv_label_create(scr_setup);
   lv_obj_set_style_text_color(setupHint3, ral7037(), 0);
-  lv_label_set_text(setupHint3, "Swipe: back to clock");
+  lv_label_set_text(setupHint3, "Swipe RIGHT: clock  /  LEFT: monitor");
   lv_obj_align(setupHint3, LV_ALIGN_BOTTOM_RIGHT, -10, -6);
+
+  // ===== MONITOR (remote pitch/roll over WiFi) =====
+  lv_obj_t* monitorTitle = lv_label_create(scr_monitor);
+  lv_obj_set_style_text_color(monitorTitle, lv_color_white(), 0);
+  lv_label_set_text(monitorTitle, "REMOTE MONITOR");
+  lv_obj_align(monitorTitle, LV_ALIGN_TOP_MID, 0, 10);
+
+  monitor_status_lbl = lv_label_create(scr_monitor);
+  lv_obj_set_style_text_color(monitor_status_lbl, ral7037(), 0);
+  lv_label_set_text(monitor_status_lbl, "Starting...");
+  lv_obj_set_style_text_align(monitor_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_align(monitor_status_lbl, LV_ALIGN_TOP_MID, 0, 40);
+
+  monitor_address_lbl = lv_label_create(scr_monitor);
+  lv_obj_set_style_text_color(monitor_address_lbl, lv_color_white(), 0);
+  lv_label_set_text(monitor_address_lbl, "---");
+  lv_obj_set_style_text_align(monitor_address_lbl, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_align(monitor_address_lbl, LV_ALIGN_TOP_MID, 0, 80);
+
+  lv_obj_t* monitorPitchTag = lv_label_create(scr_monitor);
+  lv_obj_set_style_text_color(monitorPitchTag, ral7037(), 0);
+  lv_label_set_text(monitorPitchTag, "PITCH");
+  lv_obj_align(monitorPitchTag, LV_ALIGN_CENTER, -60, 20);
+
+  monitor_pitch_lbl = lv_label_create(scr_monitor);
+  lv_obj_set_style_text_color(monitor_pitch_lbl, lv_color_white(), 0);
+  lv_label_set_text(monitor_pitch_lbl, "--");
+  lv_obj_align(monitor_pitch_lbl, LV_ALIGN_CENTER, -60, 45);
+
+  lv_obj_t* monitorRollTag = lv_label_create(scr_monitor);
+  lv_obj_set_style_text_color(monitorRollTag, ral7037(), 0);
+  lv_label_set_text(monitorRollTag, "ROLL");
+  lv_obj_align(monitorRollTag, LV_ALIGN_CENTER, 60, 20);
+
+  monitor_roll_lbl = lv_label_create(scr_monitor);
+  lv_obj_set_style_text_color(monitor_roll_lbl, lv_color_white(), 0);
+  lv_label_set_text(monitor_roll_lbl, "--");
+  lv_obj_align(monitor_roll_lbl, LV_ALIGN_CENTER, 60, 45);
+
+  lv_obj_t* monitorHint = lv_label_create(scr_monitor);
+  lv_obj_set_style_text_color(monitorHint, ral7037(), 0);
+  lv_label_set_text(monitorHint, "Swipe RIGHT: setup  /  LEFT: clock");
+  lv_obj_align(monitorHint, LV_ALIGN_BOTTOM_RIGHT, -10, -6);
 
   g_wifi_blink_timer = lv_timer_create(wifi_blink_cb, WIFI_ICON_BLINK_MS, nullptr);
 }
@@ -1254,6 +1361,10 @@ void loop()
     // WiFi/NTP
     wifi_ntp_update_state();
 
+    // Remote monitor serving directly over an existing STA connection
+    // (no AP involved, so it isn't covered by wifi_portal_loop() above).
+    if (wifi_monitor_is_active()) wifi_monitor_service();
+
     // Decide when to leave splash screen:
     // 1) normal path: WiFi + NTP ready
     // 2) offline path: timeout after SPLASH_MAX_WAIT_MS since boot
@@ -1282,8 +1393,11 @@ void loop()
   if ((uint32_t)(now - lastUi) >= UI_PERIOD_MS) {
     lastUi = now;
 
-    // Keep clock updated only when visible and time is set
-    if (current_screen == SCR_CLOCK && timeClient.isTimeSet() && g_clock_shown_after_ntp) {
+    // Keep clock updated only when visible and time is set - also while
+    // on MONITOR, so the remote page's time/date doesn't go stale (its
+    // labels are harmlessly updated too; they're just off-screen there).
+    if ((current_screen == SCR_CLOCK || current_screen == SCR_MONITOR) &&
+        timeClient.isTimeSet() && g_clock_shown_after_ntp) {
       update_time_from_ntp();
     }
 
@@ -1302,6 +1416,19 @@ void loop()
 #endif
 
         ui_update(pitchDeg, rollDeg, s.long_g, s.lat_g);
+      }
+    }
+
+    // Monitor screen - mirror the same live numbers shown remotely
+    // (see handleLive() in wifi_portal.cpp - same sign/magnitude convention)
+    if (current_screen == SCR_MONITOR) {
+      ImuSample s = imu_get_sample();
+      if (s.valid) {
+        static char mp[8], mr[8];
+        snprintf(mp, sizeof(mp), "%d", (int)lroundf(-s.pitchDeg));
+        snprintf(mr, sizeof(mr), "%d", (int)lroundf(fabsf(s.rollDeg)));
+        if (monitor_pitch_lbl) lv_label_set_text(monitor_pitch_lbl, mp);
+        if (monitor_roll_lbl)  lv_label_set_text(monitor_roll_lbl, mr);
       }
     }
   }

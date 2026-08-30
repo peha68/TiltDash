@@ -1,8 +1,13 @@
 #include "wifi_portal.h"
+#include "imu.h"
+#include "tiltdash_images_105_alpha.h" // whatever vehicle graphics are currently compiled in - see img_assets/
 
+#include <math.h>
+#include <string.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
+#include <ESPmDNS.h>
 #include <Preferences.h>
 
 // ====== NVS ======
@@ -64,6 +69,15 @@ static bool        g_apActive = false;
 static String      g_apSsid;
 static IPAddress   g_apIp;
 static const uint32_t DNS_PORT = 53;
+static bool        g_httpHandlersRegistered = false;
+
+// ====== Remote monitor ======
+static bool   g_monitorMode      = false; // true: handleRoot() serves the live-data page, not the setup form
+static bool   g_monitorServing   = false; // server.begin() called directly on an existing STA connection (no AP)
+static bool   g_monitorUsingOwnAp = false;
+static String g_mdnsHostname;
+static String g_monitorTimeStr = "--:--";
+static String g_monitorDateStr = "----------";
 
 // ====== Helpers ======
 
@@ -74,6 +88,16 @@ static String buildApSsid()
     uint64_t mac = ESP.getEfuseMac();
     char buf[32];
     snprintf(buf, sizeof(buf), "TiltDash-%04X", (unsigned)(mac & 0xFFFF));
+    return String(buf);
+}
+
+static String buildMdnsHostname()
+{
+    // Same MAC suffix as the AP SSID (lowercased, hyphenated) so multiple
+    // units on one network resolve to distinct <name>.local addresses.
+    uint64_t mac = ESP.getEfuseMac();
+    char buf[32];
+    snprintf(buf, sizeof(buf), "tiltdash-%04x", (unsigned)(mac & 0xFFFF));
     return String(buf);
 }
 
@@ -155,29 +179,216 @@ static void handleScan()
     server.send(200, "application/json", json);
 }
 
+// Must match PITCH_SIGN/ROLL_SIGN in main.cpp - only used here to rotate
+// the monitor page's icons the same visual direction as the on-device
+// side/back images (lv_img_set_angle). Small enough to duplicate rather
+// than pull main.cpp's UI constants into this module.
+static constexpr int MONITOR_PITCH_SIGN = -1;
+static constexpr int MONITOR_ROLL_SIGN  = +1;
+
+// Handles GET /live: current pitch/roll as JSON, polled from the monitor
+// page's own JS. Cheap - just reads the last IMU sample, no scanning or
+// mode changes involved.
+static void handleLive()
+{
+    ImuSample s = imu_get_sample();
+    // pitch/roll: same sign/magnitude convention as the on-device MAIN/
+    // MONITOR number readouts (see ui_update() in main.cpp) - pitch
+    // negated (nose-down/downhill reads negative), roll a positive
+    // magnitude only. pitchAngle/rollAngle: raw signed degrees, for
+    // rotating the page's icons the same direction as the real images.
+    char json[160];
+    snprintf(json, sizeof(json),
+             "{\"pitch\":%.1f,\"roll\":%.1f,\"pitchAngle\":%.1f,\"rollAngle\":%.1f,\"valid\":%s,"
+             "\"time\":\"%s\",\"date\":\"%s\"}",
+             -s.pitchDeg, fabsf(s.rollDeg),
+             MONITOR_PITCH_SIGN * s.pitchDeg, MONITOR_ROLL_SIGN * s.rollDeg,
+             s.valid ? "true" : "false",
+             g_monitorTimeStr.c_str(), g_monitorDateStr.c_str());
+    server.send(200, "application/json", json);
+}
+
+static inline void put16LE(uint8_t* p, uint16_t v) { p[0] = v & 0xFF; p[1] = (v >> 8) & 0xFF; }
+static inline void put32LE(uint8_t* p, uint32_t v) {
+    p[0] = v & 0xFF; p[1] = (v >> 8) & 0xFF; p[2] = (v >> 16) & 0xFF; p[3] = (v >> 24) & 0xFF;
+}
+
+// Renders a TRUE_COLOR_ALPHA lv_img_dsc_t (the same vehicle graphics used
+// on-device - see tiltdash_images_105_alpha.h, whichever preset from
+// img_assets/ is currently compiled in) as a 24-bit BMP for the monitor
+// page's <img> tags. Plain BMP has no alpha channel, so transparent
+// pixels are alpha-blended onto a fixed dark background matching the
+// page's .card color instead. Built fresh per request and freed right
+// after - these are small (at most 276x105 -> under 90KB) and this
+// endpoint is only hit once per page load, not worth caching.
+static void sendLvImageAsBmp(const lv_img_dsc_t& img)
+{
+    const int w = img.header.w;
+    const int h = img.header.h;
+    const int rowBytes = ((w * 3 + 3) / 4) * 4; // BMP rows pad to a 4-byte boundary
+    const size_t pixelDataSize = (size_t)rowBytes * h;
+    const size_t fileSize = 54 + pixelDataSize; // 14B file header + 40B DIB header
+
+    // Streamed one row at a time rather than built in a single fileSize
+    // buffer: the side image alone needs ~87KB contiguous, which can fail
+    // under heap fragmentation even when total free heap looks plenty -
+    // that's exactly what made it not load while the smaller back image
+    // (~36KB) worked fine. A row buffer only ever needs to hold the
+    // widest image's single row (well under 1KB).
+    uint8_t header[54] = {0};
+    header[0] = 'B'; header[1] = 'M';
+    put32LE(header + 2,  (uint32_t)fileSize);
+    put32LE(header + 10, 54);              // pixel data offset
+    put32LE(header + 14, 40);              // DIB header size
+    put32LE(header + 18, (uint32_t)w);
+    put32LE(header + 22, (uint32_t)h);     // positive height = bottom-up row order
+    put16LE(header + 26, 1);               // color planes
+    put16LE(header + 28, 24);              // bits per pixel
+    put32LE(header + 34, (uint32_t)pixelDataSize);
+
+    // Background to blend transparent pixels against - matches the
+    // monitor page's .card background (#222222).
+    const uint8_t bgR = 0x22, bgG = 0x22, bgB = 0x22;
+
+    server.setContentLength(fileSize);
+    server.send(200, "image/bmp", "");
+    server.sendContent((const char*)header, sizeof(header));
+
+    uint8_t rowBuf[900]; // >= widest supported image (276px * 3B, padded)
+    const uint8_t* src = img.data; // per pixel: RGB565 (2 bytes, little-endian) + alpha (1 byte)
+    for (int y = h - 1; y >= 0; y--) { // BMP rows are bottom-up
+        const uint8_t* srcRow = src + (size_t)y * w * 3;
+        for (int x = 0; x < w; x++) {
+            uint16_t rgb565 = srcRow[x * 3] | (srcRow[x * 3 + 1] << 8);
+            uint8_t a  = srcRow[x * 3 + 2];
+            uint8_t r5 = (rgb565 >> 11) & 0x1F;
+            uint8_t g6 = (rgb565 >> 5)  & 0x3F;
+            uint8_t b5 = rgb565 & 0x1F;
+            uint8_t r8 = (r5 << 3) | (r5 >> 2);
+            uint8_t g8 = (g6 << 2) | (g6 >> 4);
+            uint8_t b8 = (b5 << 3) | (b5 >> 2);
+            rowBuf[x * 3 + 0] = (uint8_t)((b8 * a + bgB * (255 - a)) / 255); // BMP is BGR
+            rowBuf[x * 3 + 1] = (uint8_t)((g8 * a + bgG * (255 - a)) / 255);
+            rowBuf[x * 3 + 2] = (uint8_t)((r8 * a + bgR * (255 - a)) / 255);
+        }
+        for (int pad = w * 3; pad < rowBytes; pad++) rowBuf[pad] = 0; // row padding bytes
+        server.sendContent((const char*)rowBuf, rowBytes);
+    }
+}
+
+static void handleSideImg() { sendLvImageAsBmp(tiltdash_side_105_alpha); }
+static void handleBackImg() { sendLvImageAsBmp(tiltdash_back_105_alpha); }
+
+// The remote-monitor page: shows live pitch/roll, auto-refreshed via
+// /live, so a phone can watch it from outside the vehicle while
+// levelling. Rendered by handleRoot() when g_monitorMode is set - see
+// wifi_monitor_start().
+static void handleMonitorRoot()
+{
+    String page;
+    page.reserve(3200);
+
+    page += "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+            "<title>TiltDash - Monitor</title>"
+            "<style>"
+            "*{box-sizing:border-box}"
+            "body{font-family:-apple-system,'Segoe UI',Roboto,sans-serif;background:#111;color:#eee;"
+            "padding:24px 16px;max-width:420px;margin:auto;text-align:center}"
+            "header{margin-bottom:28px}"
+            "h1{font-size:19px;font-weight:600;margin:0;letter-spacing:.3px}"
+            ".sub{display:flex;align-items:center;justify-content:center;gap:6px;"
+            "margin-top:6px;font-size:12px;color:#7b7d7d;text-transform:uppercase;letter-spacing:1px}"
+            ".dot{width:7px;height:7px;border-radius:50%;background:#5ad16b;"
+            "animation:pulse 1.6s ease-in-out infinite}"
+            "@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}"
+            ".row{display:flex;gap:14px}"
+            ".card{flex:1;background:#1c1c1c;border:1px solid #2a2a2a;border-radius:14px;"
+            "padding:18px 8px 16px;box-shadow:0 4px 14px rgba(0,0,0,.35)}"
+            ".icon-wrap{height:64px;display:flex;align-items:center;justify-content:center}"
+            ".icon{transition:transform 0.2s ease-out}"
+            ".label{font-size:12px;color:#7b7d7d;letter-spacing:1.5px;margin-top:14px}"
+            ".val{font-size:44px;font-weight:700;margin-top:2px;font-variant-numeric:tabular-nums}"
+            ".deg{font-size:20px;color:#7b7d7d;font-weight:400;vertical-align:14px;line-height:1}"
+            ".clock{margin:16px 0 22px}"
+            ".clock #time{font-size:30px;font-weight:600;font-variant-numeric:tabular-nums}"
+            ".clock #date{display:block;font-size:12px;color:#7b7d7d;margin-top:2px}"
+            "</style></head><body>"
+            "<header><h1>TiltDash</h1>"
+            "<div class='sub'><span class='dot'></span>Live monitor</div></header>"
+            "<div class='clock'><span id='time'>--:--</span><span id='date'>----------</span></div>"
+            "<div class='row'>"
+            "<div class='card'>"
+            // Same vehicle graphics as the on-device display, served as
+            // BMP (see /side.bmp - sendLvImageAsBmp() in this file) - one
+            // static image, rotated live via CSS transform exactly like
+            // lv_img_set_angle() does on-screen. Both icons sit in a
+            // fixed-height wrapper so the differing image aspect ratios
+            // (side is wide, back is tall) don't push the labels below
+            // them out of alignment between the two cards.
+            "<div class='icon-wrap'><img class='icon' id='pitchIcon' src='/side.bmp' width='130'></div>"
+            "<div class='label'>PITCH</div><div class='val' id='p'>--<span class='deg'>&deg;</span></div></div>"
+            "<div class='card'>"
+            "<div class='icon-wrap'><img class='icon' id='rollIcon' src='/back.bmp' width='62'></div>"
+            "<div class='label'>ROLL</div><div class='val' id='r'>--<span class='deg'>&deg;</span></div></div>"
+            "</div>"
+            "<script>"
+            "function poll(){"
+            "fetch('/live').then(function(r){return r.json();}).then(function(d){"
+            "document.getElementById('p').innerHTML=(d.valid?d.pitch.toFixed(0):'--')+\"<span class='deg'>&deg;</span>\";"
+            "document.getElementById('r').innerHTML=(d.valid?d.roll.toFixed(0):'--')+\"<span class='deg'>&deg;</span>\";"
+            "document.getElementById('pitchIcon').style.transform="
+            "'rotate('+(d.valid?d.pitchAngle:0)+'deg)';"
+            "document.getElementById('rollIcon').style.transform="
+            "'rotate('+(d.valid?d.rollAngle:0)+'deg)';"
+            "document.getElementById('time').textContent=d.time;"
+            "document.getElementById('date').textContent=d.date;"
+            "});"
+            "}"
+            "poll();setInterval(poll,400);"
+            "</script>"
+            "</body></html>";
+
+    server.send(200, "text/html", page);
+}
+
 static void handleRoot()
 {
+    if (g_monitorMode) { handleMonitorRoot(); return; }
+
     Serial.printf("[WIFI-PORTAL] GET %s from %s (heap free=%u)\n",
                   server.uri().c_str(), server.client().remoteIP().toString().c_str(),
                   (unsigned)ESP.getFreeHeap());
 
     String page;
-    page.reserve(4000); // room for the timezone <option> list
+    page.reserve(4600); // room for the timezone <option> list
 
     page += "<!DOCTYPE html><html><head><meta charset='utf-8'>"
             "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-            "<title>TiltDash - WiFi setup</title>"
+            "<title>TiltDash - Setup</title>"
             "<style>"
-            "body{font-family:sans-serif;background:#111;color:#eee;padding:20px;max-width:420px;margin:auto}"
-            "h1{font-size:20px}"
-            "label{display:block;margin-top:14px;font-size:14px;color:#aaa}"
-            "select,input{width:100%;padding:10px;margin-top:4px;box-sizing:border-box;"
-            "background:#222;color:#eee;border:1px solid #444;border-radius:6px;font-size:16px}"
-            "button{width:100%;padding:12px;margin-top:20px;background:#7b7d7d;color:#111;"
-            "border:none;border-radius:6px;font-size:16px;font-weight:bold}"
-            "button.secondary{background:#333;color:#eee;margin-top:8px}"
+            "*{box-sizing:border-box}"
+            "body{font-family:-apple-system,'Segoe UI',Roboto,sans-serif;background:#111;color:#eee;"
+            "padding:24px 16px;max-width:420px;margin:auto;text-align:center}"
+            "header{margin-bottom:24px}"
+            "h1{font-size:19px;font-weight:600;margin:0;letter-spacing:.3px}"
+            ".sub{margin-top:6px;font-size:12px;color:#7b7d7d;text-transform:uppercase;letter-spacing:1px}"
+            ".card{background:#1c1c1c;border:1px solid #2a2a2a;border-radius:14px;"
+            "padding:18px 16px;box-shadow:0 4px 14px rgba(0,0,0,.35);margin-bottom:16px;text-align:left}"
+            ".card h2{font-size:13px;font-weight:600;color:#7b7d7d;text-transform:uppercase;"
+            "letter-spacing:1px;margin:0 0 14px}"
+            "label{display:block;margin-top:14px;font-size:13px;color:#999}"
+            "label:first-of-type{margin-top:0}"
+            "select,input{width:100%;padding:11px;margin-top:5px;"
+            "background:#111;color:#eee;border:1px solid #333;border-radius:8px;font-size:15px}"
+            "select:focus,input:focus{outline:none;border-color:#7b7d7d}"
+            "button{width:100%;padding:13px;margin-top:16px;background:#7b7d7d;color:#111;"
+            "border:none;border-radius:8px;font-size:15px;font-weight:600}"
+            "button.secondary{background:transparent;color:#ccc;border:1px solid #333;margin-top:8px}"
             "</style></head><body>"
-            "<h1>TiltDash &ndash; WiFi setup</h1>"
+            "<header><h1>TiltDash</h1><div class='sub'>Setup</div></header>"
+            "<div class='card'>"
+            "<h2>WiFi network</h2>"
             "<form action='/save' method='POST'>"
             "<label>Detected networks</label>"
             "<select id='ssid_scan' onchange=\"document.getElementById('ssid').value=this.value\">"
@@ -190,9 +401,11 @@ static void handleRoot()
             "<input type='password' name='pass' maxlength='63'>"
             "<button type='submit'>Save and connect</button>"
             "</form>"
-            "<hr style='margin-top:24px;border-color:#333'>"
+            "</div>"
+            "<div class='card'>"
+            "<h2>Timezone</h2>"
             "<form action='/save_tz' method='POST'>"
-            "<label>Timezone (independent of WiFi - saving this does not require a network)</label>"
+            "<label>Independent of WiFi - saving this does not require a network</label>"
             "<select name='tz'>";
     for (size_t i = 0; i < TZ_OPTIONS_COUNT; i++) {
         page += "<option value='";
@@ -206,6 +419,7 @@ static void handleRoot()
     page += "</select>"
             "<button type='submit'>Save timezone</button>"
             "</form>"
+            "</div>"
             "<script>"
             "function scanNow(){"
             "var sel=document.getElementById('ssid_scan');"
@@ -284,6 +498,27 @@ static void handleSaveTz()
                   tzMin, server.arg("tz").c_str());
     delay(1200);
     ESP.restart();
+}
+
+// Registers every HTTP route once - shared between the setup portal (its
+// own AP) and the remote monitor (either that same AP as a fallback, or
+// directly over an existing STA connection). server.stop() doesn't clear
+// the handler list, so calling this more than once would just duplicate
+// entries.
+static void ensureHttpHandlersRegistered()
+{
+    if (g_httpHandlersRegistered) return;
+    server.on("/", HTTP_GET, handleRoot);
+    server.on("/scan", HTTP_GET, handleScan);
+    server.on("/save", HTTP_POST, handleSave);
+    server.on("/save_tz", HTTP_POST, handleSaveTz);
+    server.on("/live", HTTP_GET, handleLive);
+    server.on("/side.bmp", HTTP_GET, handleSideImg);
+    server.on("/back.bmp", HTTP_GET, handleBackImg);
+    // Captive portal: any other path also serves the current page, so the
+    // phone/OS detects the portal and pops the sign-in prompt itself.
+    server.onNotFound(handleRoot);
+    g_httpHandlersRegistered = true;
 }
 
 // ====== API ======
@@ -395,20 +630,7 @@ void wifi_portal_start_ap()
 
     dnsServer.start(DNS_PORT, "*", g_apIp);
 
-    // Handlers are registered only once - the setup screen can be entered
-    // and left multiple times per session, and server.stop() doesn't
-    // clear the handler list, so re-registering would just duplicate them.
-    static bool handlersRegistered = false;
-    if (!handlersRegistered) {
-        server.on("/", HTTP_GET, handleRoot);
-        server.on("/scan", HTTP_GET, handleScan);
-        server.on("/save", HTTP_POST, handleSave);
-        server.on("/save_tz", HTTP_POST, handleSaveTz);
-        // Captive portal: any other path also serves the form, so the
-        // phone/OS detects the portal and pops the sign-in prompt itself.
-        server.onNotFound(handleRoot);
-        handlersRegistered = true;
-    }
+    ensureHttpHandlersRegistered();
     server.begin();
 
     g_apActive = true;
@@ -441,3 +663,81 @@ void wifi_portal_loop()
 
 const char* wifi_portal_ap_ssid() { return g_apSsid.c_str(); }
 IPAddress wifi_portal_ap_ip() { return g_apIp; }
+
+// ====== Remote monitor ======
+
+void wifi_monitor_start()
+{
+    g_monitorMode = true;
+
+    if (WiFi.status() == WL_CONNECTED) {
+        // Already on a real network - serve straight from that, no AP
+        // needed. wifi_portal_start_ap() is NOT involved here at all, so
+        // this path is cheap: just the WebServer, no mode churn.
+        g_monitorUsingOwnAp = false;
+        ensureHttpHandlersRegistered();
+        server.begin();
+        g_monitorServing = true;
+
+        g_mdnsHostname = buildMdnsHostname();
+        if (MDNS.begin(g_mdnsHostname.c_str())) {
+            MDNS.addService("http", "tcp", 80);
+            Serial.printf("[MONITOR] Serving on existing WiFi at %s / %s.local\n",
+                          WiFi.localIP().toString().c_str(), g_mdnsHostname.c_str());
+        } else {
+            Serial.println("[MONITOR] mDNS start failed - IP address still works");
+        }
+    } else {
+        // No network to piggyback on - fall back to the same hotspot the
+        // setup screen uses. handleRoot() already checks g_monitorMode
+        // (set above) and will serve the live-data page instead of the
+        // WiFi setup form even though this is the same AP machinery.
+        g_monitorUsingOwnAp = true;
+        wifi_portal_start_ap();
+        Serial.printf("[MONITOR] No STA connection - serving from own AP '%s' at %s\n",
+                      g_apSsid.c_str(), g_apIp.toString().c_str());
+    }
+}
+
+void wifi_monitor_stop()
+{
+    g_monitorMode = false;
+
+    if (g_monitorUsingOwnAp) {
+        wifi_portal_stop_ap();
+    } else if (g_monitorServing) {
+        server.stop();
+        MDNS.end();
+        g_monitorServing = false;
+    }
+    g_monitorUsingOwnAp = false;
+
+    Serial.println("[MONITOR] Stopped.");
+}
+
+bool wifi_monitor_is_active()
+{
+    return g_monitorServing || (g_monitorUsingOwnAp && g_apActive);
+}
+
+void wifi_monitor_service()
+{
+    // The AP case is already serviced by wifi_portal_loop() (DNS + the
+    // same server.handleClient()) - this only covers the STA-direct case.
+    if (g_monitorServing) server.handleClient();
+}
+
+bool wifi_monitor_using_own_ap() { return g_monitorUsingOwnAp; }
+
+IPAddress wifi_monitor_ip()
+{
+    return g_monitorUsingOwnAp ? g_apIp : WiFi.localIP();
+}
+
+const char* wifi_monitor_hostname() { return g_mdnsHostname.c_str(); }
+
+void wifi_monitor_set_time(const char* time_str, const char* date_str)
+{
+    g_monitorTimeStr = time_str;
+    g_monitorDateStr = date_str;
+}
